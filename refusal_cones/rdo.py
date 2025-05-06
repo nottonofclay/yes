@@ -26,7 +26,8 @@ set_seed(42)
 # Default configuration values
 DEFAULT_CONFIG = {
     # Model settings
-    'model': 'google/gemma-2-2b-it',  # Model identifier from HuggingFace
+#    'model': 'google/gemma-2-2b-it',  # Model identifier from HuggingFace
+    'model': 'google/gemma-2b-it',
     'dtype': 'bfloat16',              # Floating point precision (bfloat16, float16, float32)
     
     # Training objectives
@@ -39,7 +40,7 @@ DEFAULT_CONFIG = {
     'epochs': 1,                      # Number of training epochs
     'lr': 1e-2,                       # Learning rate for optimization
     'batch_size': 1,                  # Batch size for training
-    'effective_batch_size': 16,       # Effective batch size (uses gradient accumulation)
+    'effective_batch_size': 8,       # Effective batch size (uses gradient accumulation)
     'patience': 5,                    # Patience for early stopping
     'n_lr_reduce': 2,                 # Number of learning rate reductions before stopping
     
@@ -164,6 +165,32 @@ else:
 model = LanguageModel(MODEL_PATH, cache_dir=os.getenv("HUGGINGFACE_CACHE_DIR"), device_map='auto', torch_dtype=dtype)
 model.requires_grad_(False)
 
+
+if model.tokenizer.pad_token is None:
+    model.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+    model.resize_token_embeddings(len(tokenizer))
+
+# Verify that both are properly set
+print(f"Pad token: {model.tokenizer.pad_token}, Pad token ID: {model.tokenizer.pad_token_id}")
+#if model.tokenizer.pad_token is None:
+#    model.tokenizer.pad_token = model.tokenizer.eos_token
+#    # For Qwen models
+#    if "qwen" in MODEL_PATH.lower():
+#        # Just use an existing token
+#        model.tokenizer.pad_token = model.tokenizer.eos_token
+#    # For Gemma models
+#    elif "gemma" in MODEL_PATH.lower():
+#        model.tokenizer.pad_token = model.tokenizer.eos_token
+#    # For other models
+#    else:
+#        try:
+#            model.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+#            # Resize token embeddings to accommodate new token
+#            model.resize_token_embeddings(len(model.tokenizer))
+#        except ValueError:
+#            # Fall back to using eos_token if adding special tokens fails
+#            model.tokenizer.pad_token = model.tokenizer.eos_token
+            
 # %%
 # loading and testing model
 with model.trace("Hello") as tracer:
@@ -171,7 +198,8 @@ with model.trace("Hello") as tracer:
 
 # %%
 model_id = MODEL_PATH.split("/")[-1]
-dim_dir_path = f"{os.getenv('SAVE_DIR')}/{os.getenv('DIM_DIR')}/{model_id}"
+dim_dir_path = f"./refusal_direction/pipeline/runs/{model_id}/"
+print(dim_dir_path)
 direction_file = f"{dim_dir_path}/direction.pt"
 metadata_file = f"{dim_dir_path}/direction_metadata.json"
 mean_diffs_file = f"{dim_dir_path}/generate_directions/mean_diffs.pt"
@@ -189,7 +217,7 @@ best_token = refusal_results["pos"]
 best_refusal_direction = torch.load(direction_file).to(model.dtype)
 
 # %%
-SAVE_DIR = f"{os.getenv('SAVE_DIR')}/rdo/{MODEL_PATH.split('/')[-1]}/"
+SAVE_DIR = f"{os.getenv('SAVE_DIR')}/rdo/{MODEL_PATH.split('/')[-1]}"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 add_layer = best_layer
@@ -197,8 +225,10 @@ alpha = best_refusal_direction.norm().detach().clone()
 print(f"add_layer: {add_layer}, alpha: {alpha}")
 
 # %%
-harmful_train = json.load(open(f'data/{splits}_splits/harmful_train.json'))
-harmless_train = json.load(open(f'data/{splits}_splits/harmless_train.json'))
+#harmful_train = json.load(open(f'data/{splits}_splits/harmful_train.json'))
+#harmless_train = json.load(open(f'data/{splits}_splits/harmless_train.json'))
+harmful_train = json.load(open(f'refusal_direction/dataset/splits/harmful_train.json'))
+harmless_train = json.load(open(f'refusal_direction/dataset/splits/harmless_train.json'))
 
 harmless_train = harmless_train[:len(harmful_train)]
 print(len(harmful_train), len(harmless_train))
@@ -225,6 +255,8 @@ def apply_chat_template(tokenizer, instructions: list[str]):
         prompts = [LLAMA3_CHAT_TEMPLATE.format(instruction=inst) for inst in instructions]
     elif "gemma" in MODEL_PATH.lower():
         prompts = [GEMMA_CHAT_TEMPLATE.format(instruction=inst) for inst in instructions]
+    elif "qwen" in MODEL_PATH.lower():
+        prompts = [QWEN25_CHAT_TEMPLATE.format(instruction=inst) for inst in instructions]
     elif "qwen2.5" in MODEL_PATH.lower():
         prompts = [QWEN25_CHAT_TEMPLATE.format(instruction=inst) for inst in instructions]
     else:
@@ -259,6 +291,8 @@ print(example_tokens)
 # %%
 if "gemma" in MODEL_PATH.lower():
     refusal_tokens = [235285]
+elif "qwen" in MODEL_PATH.lower():
+    refusal_tokens = [40, 2121]
 elif "qwen2.5" in MODEL_PATH.lower():
     refusal_tokens = [40, 2121]
 elif "llama-3" in MODEL_PATH.lower():
@@ -575,7 +609,7 @@ class RefusalCone(nn.Module):
     
     def ablate_output(self, layer, direction, tuple_length=1):
         activation = layer.output[0][:]
-
+        
         if tuple_length > 1:
             activation = layer.output[0][:]
         else:
@@ -586,7 +620,15 @@ class RefusalCone(nn.Module):
             layer.output = (new_activation,) + layer.output[1:]
         else:
             layer.output = new_activation
+        #if tuple_length == 2:
+        #    layer.output = (new_activation, layer.output[1])
+        #elif tuple_length == 3:
+        #    for item 
+        #    layer.output = (new_activation, layer.output[1], layer.output[2])
+        #elif tuple_length == 1:
+        #    layer.output = new_activation
 
+    
     def ablate_input(self, layer, direction):
         projection = projection_einops(layer.input, direction)
         new_activation = layer.input - projection
@@ -1125,21 +1167,79 @@ class DirectionalAblation(nn.Module):
             self.ablate_input(layer, direction)
             self.ablate_output(layer.self_attn, direction, 3)
             self.ablate_output(layer.mlp, direction, 1)
-    
-    def ablate_output(self, layer, direction, tuple_length=1):
-        activation = layer.output[0][:]
-        
-        if tuple_length > 1:
-            activation = layer.output[0][:]
-        else:
-            activation = layer.output
-        projection = projection_einops(activation, direction)
-        new_activation = activation - projection
-        if tuple_length > 1:
-            layer.output = (new_activation,) + layer.output[1:]
-        else:
-            layer.output = new_activation
 
+        
+#    def ablate_output(self, layer, direction, tuple_length=1):
+#        print("PLEAE DBUEG HERE++++++++++++++++++++++______________-==-=-=-=--=======--=-")
+#        print(layer.output[0])
+#        print(layer.output[1])
+#        print(layer.output[2])
+#        if tuple_length > 1:
+#            activation = layer.output[0][:]
+#        else:
+#            activation = layer.output
+#        projection = projection_einops(activation, direction)
+#        new_activation = activation - projection
+#        if tuple_length == 2:
+#            layer.output = (new_activation, layer.output[1])
+#        elif tuple_length == 3:
+#            layer.output = (new_activation, layer.output[1], layer.output[2])
+#        elif tuple_length == 1:
+#            layer.output = new_activation
+    def ablate_output(self, layer, direction, tuple_length=1):
+        """
+        Safely ablate the output of a layer by subtracting the projection of the 
+        activation onto the direction.
+        
+        Args:
+            layer: The layer whose output to ablate
+            direction: The direction to project onto
+            tuple_length: Expected tuple length of layer.output
+        """
+
+#        print(f"Layer type: {type(layer).__name__}")
+#        print(f"Output type: {type(layer.output).__name__}")
+        projection = projection_einops(layer.output, direction)
+        layer.output = layer.output - projection
+        # Check if output is a tuple
+#        if isinstance(layer.output, tuple):
+#            print(f"Tuple length: {len(layer.output)}")
+#           for i, item in enumerate(layer.output):
+#                print(f"Item {i} type: {type(item).__name__}")
+#            
+#            # Handle based on actual tuple length
+#            if len(layer.output) > 0:
+#                # First element is usually the hidden states/activation
+#                if isinstance(layer.output[0], torch.Tensor):
+#                    activation = layer.output[0]
+#                    # Compute projection and ablate
+#                    projection = projection_einops(activation, direction)
+#                    new_activation = activation - projection
+#                    
+#                    # Reconstruct the tuple with the ablated activation
+#                    if len(layer.output) == 2:
+#                        layer.output = (new_activation, layer.output[1])
+#                    elif len(layer.output) == 3:
+#                        layer.output = (new_activation, layer.output[1], layer.output[2])
+#                    else:
+#                        # Create a new tuple with same length
+#                        output_list = list(layer.output)
+#                        output_list[0] = new_activation
+#                        layer.output = tuple(output_list)
+#                else:
+#                    print(f"Warning: First element of tuple is not a tensor: {type(layer.output[0]).__name__}")
+#            else:
+#                print("Warning: Empty tuple as layer output")
+#        else:
+#            # If not a tuple, treat as a tensor directly
+#            if isinstance(layer.output, torch.Tensor):
+#                activation = layer.output
+#                projection = projection_einops(activation, direction)
+#                new_activation = activation - projection
+#                layer.output = new_activation
+#            else:
+#                print(f"Warning: Unexpected output type: {type(layer.output).__name__}")
+    
     def ablate_input(self, layer, direction):
         projection = projection_einops(layer.input, direction)
         new_activation = layer.input - projection
@@ -1199,6 +1299,15 @@ def repind_rdo(model,
                independent_vectors=[],
                verbose=False,
                init_vector=None):
+    
+#    with model.trace("Hello") as tracer:
+#        for i, layer in enumerate(model.model.layers):
+#            print(f"Layer {i} self_attn output type: {type(layer.self_attn.output)}")
+#            print(f"Layer {i} self_attn output type: {type(layer.self_attn)}")
+#            print("HERE PLEASE DUEBUG ++++++++++====================************=======")
+#            if isinstance(layer.self_attn.output, tuple):
+#                print("HERE PLASDOIWNA DBEUGN ++++++++++++++++++++++++++++++++++_+_+_+_+_++_")
+#                print(f"  Tuple length: {len(layer.self_attn.output)}")
 
     with model.session() as session:
         train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True, collate_fn=custom_collate)
@@ -1444,8 +1553,8 @@ def train_independent_vector(group_name=None, run_name=None, independent_vectors
 
 # %%
 if args.train_independent_direction:
-    harmful_val = json.load(open(f'data/{splits}_splits/harmful_val.json'))
-    harmless_val = json.load(open(f'data/{splits}_splits/harmless_val.json'))
+    harmful_val = json.load(open(f'refusal_direction/dataset/splits/harmful_val.json'))
+    harmless_val = json.load(open(f'refusal_direction/dataset/splits/harmless_val.json'))
     harmful_val_instructions = apply_chat_template(model.tokenizer, [d["instruction"] for d in harmful_val])
     harmless_val_instructions = apply_chat_template(model.tokenizer, [d["instruction"] for d in harmless_val])
     harmful_val_scores = get_bypass_scores(model, harmful_val_instructions, refusal_tokens, batch_size=args.filter_batch_size)
@@ -1484,3 +1593,4 @@ if args.train_independent_direction:
         independent_vectors.append(lowest_loss_vectors[best_idx])
     print(mean_refusal_scores)
 # %%
+
